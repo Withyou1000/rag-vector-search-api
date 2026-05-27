@@ -6,7 +6,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.chunking import chunk_sections
-from app.embeddings import HashingEmbedding, cosine_similarity
+from app.embeddings import create_embedding_model
 from app.parsers import parse_document
 from app.vector_store import VectorStore
 
@@ -20,11 +20,12 @@ def main() -> None:
     if not chunks:
         raise AssertionError("示例文档没有切出 chunk。")
 
-    embedding = HashingEmbedding(dim=128)
+    embedding = create_embedding_model(
+        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    )
     query_vector, chunk_vector = embedding.embed(["chunk 为什么不能太大", chunks[0].text])
-    similarity = cosine_similarity(query_vector, chunk_vector)
-    if not -1.0 <= similarity <= 1.0:
-        raise AssertionError("Cosine Similarity 超出合理范围。")
+    if len(query_vector) != embedding.dim or len(chunk_vector) != embedding.dim:
+        raise AssertionError("embedding 维度与模型配置不一致。")
 
     with tempfile.TemporaryDirectory() as temp_dir:
         store = VectorStore(
@@ -45,7 +46,6 @@ def main() -> None:
             # Windows 会锁住 Qdrant 的本地 SQLite 文件，关闭后临时目录才能被删除。
             store.close()
 
-    # 这些断言覆盖了解析、切块、向量写入、搜索和文档聚合列表的主路径。
     if not document_id:
         raise AssertionError("没有生成 document_id。")
     if not hits:

@@ -11,8 +11,6 @@ from app.vector_store import VectorStore
 
 
 embedding_model = create_embedding_model(
-    provider=settings.embedding_provider,
-    dim=settings.embedding_dim,
     model_name=settings.embedding_model,
 )
 vector_store = VectorStore(
@@ -26,7 +24,7 @@ app = FastAPI(title=settings.app_name)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "embedding_provider": settings.embedding_provider}
+    return {"status": "ok", "embedding_model": settings.embedding_model}
 
 
 @app.post("/documents", response_model=IngestResponse)
