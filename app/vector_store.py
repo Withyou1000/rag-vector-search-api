@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 from uuid import uuid4
 
@@ -9,10 +8,11 @@ from qdrant_client.http import models
 
 from app.chunking import Chunk
 from app.embeddings import EmbeddingModel
+from app.storage import StoredDocument
 
 
 class VectorStore:
-    """封装 Qdrant 操作，让 API 层只关心“存 chunk”和“搜 chunk”。"""
+    """封装 Qdrant 的 dense 检索与 chunk 读写，其他排序在应用层编排。"""
 
     def __init__(self, path: str, collection_name: str, embedding_model: EmbeddingModel):
         self.client = QdrantClient(path=path)
@@ -23,58 +23,99 @@ class VectorStore:
     def _ensure_collection(self) -> None:
         collections = self.client.get_collections().collections
         exists = any(item.name == self.collection_name for item in collections)
-        if exists:
-            return
+        if not exists:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config=models.VectorParams(
+                    size=self.embedding_model.dim,
+                    distance=models.Distance.COSINE,
+                ),
+            )
+        self._ensure_indexes()
 
-        # Cosine 距离适合衡量方向相近程度，是文本 embedding 检索最常用的距离之一。
-        self.client.create_collection(
-            collection_name=self.collection_name,
-            vectors_config=models.VectorParams(
-                size=self.embedding_model.dim,
-                distance=models.Distance.COSINE,
+    def _ensure_indexes(self) -> None:
+        # 为权限、文档过滤与全文检索建立索引，后续过滤与定位更稳定。
+        self.client.create_payload_index(
+            self.collection_name,
+            "document_id",
+            models.PayloadSchemaType.KEYWORD,
+        )
+        self.client.create_payload_index(
+            self.collection_name,
+            "owner",
+            models.PayloadSchemaType.KEYWORD,
+        )
+        self.client.create_payload_index(
+            self.collection_name,
+            "visibility",
+            models.PayloadSchemaType.KEYWORD,
+        )
+        self.client.create_payload_index(
+            self.collection_name,
+            "filename",
+            models.PayloadSchemaType.KEYWORD,
+        )
+        self.client.create_payload_index(
+            self.collection_name,
+            "tags",
+            models.PayloadSchemaType.KEYWORD,
+        )
+        self.client.create_payload_index(
+            self.collection_name,
+            "text",
+            models.TextIndexParams(
+                type=models.TextIndexType.TEXT,
+                tokenizer=models.TokenizerType.WORD,
+                lowercase=True,
+                min_token_len=1,
             ),
         )
 
     def add_document(
         self,
-        filename: str,
+        *,
+        document: StoredDocument,
         chunks: list[Chunk],
-        source: str | None,
-        tags: list[str],
     ) -> str:
-        document_id = str(uuid4())
+        self.delete_document(document.document_id)
         vectors = self.embedding_model.embed(chunk.text for chunk in chunks)
-
         points: list[models.PointStruct] = []
         for chunk, vector in zip(chunks, vectors):
-            point_id = str(uuid4())
+            chunk_id = str(uuid4())
             payload: dict[str, Any] = {
-                "document_id": document_id,
-                "filename": filename,
-                "source": source,
-                "tags": tags,
+                "chunk_id": chunk_id,
+                "document_id": document.document_id,
+                "filename": document.filename,
+                "source": document.source,
+                "source_path": document.source_path,
+                "tags": document.tags,
+                "owner": document.owner,
+                "visibility": document.visibility,
+                "document_version": document.version,
+                "status": document.status,
+                "updated_at": document.updated_at,
+                "content_hash": document.content_hash,
                 "chunk_index": chunk.chunk_index,
                 "page": chunk.page,
                 "heading": chunk.heading,
-                "token_count": chunk.token_count,
+                "token_estimate": chunk.token_count,
                 "text": chunk.text,
             }
-            points.append(models.PointStruct(id=point_id, vector=vector, payload=payload))
-
-        # upsert 支持重复执行写入；生产环境可换成更严格的幂等 document_id。
+            points.append(models.PointStruct(id=chunk_id, vector=vector, payload=payload))
         self.client.upsert(collection_name=self.collection_name, points=points)
-        return document_id
+        return document.document_id
 
     def search(
         self,
+        *,
         query: str,
         top_k: int,
-        source: str | None = None,
-        tags: list[str] | None = None,
+        source: str | None,
+        tags: list[str] | None,
+        user_id: str,
     ) -> list[dict[str, Any]]:
         query_vector = self.embedding_model.embed([query])[0]
-        query_filter = self._build_filter(source=source, tags=tags)
-
+        query_filter = self._build_filter(source=source, tags=tags, user_id=user_id)
         results = self.client.search(
             collection_name=self.collection_name,
             query_vector=query_vector,
@@ -82,47 +123,26 @@ class VectorStore:
             query_filter=query_filter,
             with_payload=True,
         )
+        return [self._record_to_hit(item.payload or {}, item.score) for item in results]
 
-        hits: list[dict[str, Any]] = []
-        for item in results:
-            payload = item.payload or {}
-            hits.append(
-                {
-                    "score": item.score,
-                    "text": payload.get("text", ""),
-                    "metadata": {key: value for key, value in payload.items() if key != "text"},
-                }
-            )
-        return hits
-
-    def list_documents(self) -> list[dict[str, Any]]:
+    def list_chunks(
+        self,
+        *,
+        source: str | None,
+        tags: list[str] | None,
+        user_id: str,
+    ) -> list[dict[str, Any]]:
+        query_filter = self._build_filter(source=source, tags=tags, user_id=user_id)
         records, _ = self.client.scroll(
             collection_name=self.collection_name,
             limit=10000,
+            scroll_filter=query_filter,
             with_payload=True,
             with_vectors=False,
         )
-
-        grouped: dict[str, dict[str, Any]] = defaultdict(
-            lambda: {"chunk_count": 0, "tags": []}
-        )
-        for record in records:
-            payload = record.payload or {}
-            document_id = payload.get("document_id")
-            if not document_id:
-                continue
-
-            # Qdrant 存的是 chunk，列表接口需要按 document_id 聚合成文档视角。
-            item = grouped[document_id]
-            item["document_id"] = document_id
-            item["filename"] = payload.get("filename")
-            item["source"] = payload.get("source")
-            item["tags"] = payload.get("tags") or []
-            item["chunk_count"] += 1
-        return list(grouped.values())
+        return [record.payload or {} for record in records]
 
     def delete_document(self, document_id: str) -> None:
-        # 删除时按 payload 过滤，避免 API 层知道每个 chunk 的 point id。
         self.client.delete(
             collection_name=self.collection_name,
             points_selector=models.FilterSelector(
@@ -138,26 +158,33 @@ class VectorStore:
         )
 
     def close(self) -> None:
-        """释放 Qdrant 本地文件句柄，测试或脚本退出时尤其需要。"""
-
         self.client.close()
 
     def _build_filter(
         self,
+        *,
         source: str | None,
         tags: list[str] | None,
-    ) -> models.Filter | None:
-        conditions: list[models.FieldCondition] = []
+        user_id: str,
+    ) -> models.Filter:
+        must: list[Any] = [
+            models.FieldCondition(key="status", match=models.MatchValue(value="active"))
+        ]
+        should = [
+            models.FieldCondition(key="owner", match=models.MatchValue(value=user_id)),
+            models.FieldCondition(key="visibility", match=models.MatchValue(value="shared")),
+        ]
         if source:
-            conditions.append(
-                models.FieldCondition(key="source", match=models.MatchValue(value=source))
-            )
+            must.append(models.FieldCondition(key="source", match=models.MatchValue(value=source)))
         if tags:
             for tag in tags:
-                conditions.append(
-                    models.FieldCondition(key="tags", match=models.MatchAny(any=[tag]))
-                )
+                must.append(models.FieldCondition(key="tags", match=models.MatchAny(any=[tag])))
+        return models.Filter(must=must, should=should, min_should=models.MinShould(conditions=should, min_count=1))
 
-        if not conditions:
-            return None
-        return models.Filter(must=conditions)
+    @staticmethod
+    def _record_to_hit(payload: dict[str, Any], score: float) -> dict[str, Any]:
+        return {
+            "score": float(score),
+            "text": payload.get("text", ""),
+            "metadata": {key: value for key, value in payload.items() if key != "text"},
+        }

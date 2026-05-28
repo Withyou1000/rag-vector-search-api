@@ -1,0 +1,3 @@
+{"question":"chunk 为什么不能太大？","gold_filenames":["demo.md"],"expected_answer_points":["chunk 太大会带入过多无关内容"],"should_answer":true}
+{"question":"敏感文档默认是什么可见性？","gold_filenames":["policy.md"],"expected_answer_points":["private"],"should_answer":true}
+{"question":"员工报销流程是什么？","gold_filenames":[],"expected_answer_points":[],"should_answer":false}

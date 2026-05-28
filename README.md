@@ -1,35 +1,51 @@
-# 第三阶段项目：Embedding 和向量检索
+# 第四阶段项目：公司内部知识库 RAG
 
-这是一个“个人知识库搜索 API”的最小完整项目，用来学习 RAG 的检索地基：解析文档、切块、生成 embedding、写入向量库、按 query 召回相关片段。
+这是一个面向学习与实战的可用型 RAG 项目，目标不是只做 demo，而是把一个内部知识库问答系统真正跑起来，并且能评估它什么时候答得不对。
 
-项目刻意不生成答案，只做搜索。这样你可以先把注意力放在最关键的一步：资料能不能找准。
+当前版本支持：
+
+- 上传 `PDF / Markdown / txt`
+- 文档删除与重新索引
+- 文档 `owner / visibility` 轻量权限隔离
+- `vector / fulltext / bm25 / hybrid` 四种检索模式
+- 可选 `rerank`
+- 问答回答、引用来源、no-answer
+- 记录每次检索到的 chunk 与最终上下文
+- 简易 Web 页面
+- 冒烟脚本、API 测试、离线评测脚本
 
 ## 技术栈
 
-| 组件 | 选择 |
-| --- | --- |
-| 后端 | Python FastAPI |
-| 向量库 | Qdrant 本地模式 |
-| 文档解析 | Markdown / txt 原生解析，PDF 使用 PyMuPDF |
-| Embedding | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` |
-| 框架 | 裸写，不依赖 LangChain / LlamaIndex |
+- 后端：`FastAPI`
+- 向量库：`Qdrant` 本地模式
+- Embedding：`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- 问答生成：`OpenAI 兼容 API`
+- 文档解析：Markdown / txt 原生解析，PDF 使用 `PyMuPDF`
 
-## 项目结构
+## 目录结构
 
 ```text
 app/
-  main.py          # FastAPI 接口
-  parsers.py       # Markdown / txt / PDF 解析
-  chunking.py      # 按段落、标题、代码块切块
-  embeddings.py    # sentence-transformers embedding
-  vector_store.py  # Qdrant 写入、检索、删除
-  schemas.py       # API 输入输出模型
-  config.py        # 配置加载
-samples/
-  demo.md          # 可上传的示例文档
+  asgi.py         # Uvicorn 启动入口
+  main.py         # FastAPI 应用工厂与路由
+  parsers.py      # PDF / Markdown / txt 解析
+  chunking.py     # 文档切块
+  embeddings.py   # Dense embedding 模型
+  vector_store.py # Qdrant dense 存取
+  retrieval.py    # BM25 / fulltext / hybrid / rerank 编排
+  llm.py          # Query rewrite 与答案生成
+  storage.py      # 文档元数据与 retrieval trace 存储
+  schemas.py      # API 模型
 scripts/
-  run_server.ps1   # Windows PowerShell 启动脚本
-  smoke_test.py    # 基础烟测
+  run_server.ps1  # 启动服务
+  smoke_test.py   # 端到端冒烟验证
+  evaluate_rag.py # 离线评测脚本
+tests/
+  test_rag_api.py # API 自动化测试
+samples/
+  demo.md
+  policy.md
+  evaluation/company_eval.jsonl
 ```
 
 ## 快速开始
@@ -38,103 +54,124 @@ scripts/
 python -m venv .venv
 .\.venv\Scripts\activate
 pip install -r requirements.txt
+Copy-Item .env.example .env
 .\scripts\run_server.ps1
 ```
 
-也可以直接用普通命令启动：
+服务启动后访问：
 
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
+- 文档与问答页面：[http://127.0.0.1:8000](http://127.0.0.1:8000)
+- API 文档：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- 健康检查：[http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+
+## 环境变量
+
+`.env.example` 已给出常用配置，重点如下：
+
+```env
+EMBEDDING_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+EMBEDDING_DIM=384
+CHUNK_SIZE_TOKENS=350
+CHUNK_OVERLAP_TOKENS=60
+OPENAI_BASE_URL=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-4o-mini
+APP_DATA_DIR=.rag_data
 ```
 
-启动后访问：
+说明：
 
-- API 文档：`http://127.0.0.1:8000/docs`
-- 健康检查：`http://127.0.0.1:8000/health`
+- 如果不配置 `OPENAI_*`，系统仍可运行，但问答会退化成基于检索片段的摘要式回答。
+- 本地 Qdrant 模式下会提示 payload index 在本地模式不生效，这是正常现象，不影响当前项目运行。
 
-默认启动后就会使用 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`。
-项目根目录提供了一个可直接编辑的 `.env`，如果你后面想换模型或调整切块参数，直接改 `.env` 即可。
+## API 概览
 
-## 首次运行说明
-
-- 第一次运行真实语义 embedding 时，会联网下载 Hugging Face 模型到本地缓存，首次启动会明显慢一些。
-- 如果你之前已经建过旧的向量库，改模型后要先删除 `.qdrant`，再重新上传文档。
-
-清理旧库示例：
+### 1. 上传文档
 
 ```powershell
-Remove-Item -Recurse -Force .qdrant
+curl.exe -X POST "http://127.0.0.1:8000/documents" `
+  -F "file=@samples/demo.md" `
+  -F "owner=alice" `
+  -F "visibility=private" `
+  -F "source=internal" `
+  -F "tags=rag,embedding"
 ```
 
-## 基础验证
+### 2. 搜索
 
-如果你想先确认核心链路能跑通，可以执行：
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/search" `
+  -H "Content-Type: application/json" `
+  -d "{\"query\":\"chunk 为什么不能太大\",\"mode\":\"hybrid\",\"enable_rerank\":true,\"user_id\":\"alice\",\"top_k\":5}"
+```
+
+### 3. 问答
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/ask" `
+  -H "Content-Type: application/json" `
+  -d "{\"question\":\"chunk 为什么不能太大？\",\"mode\":\"hybrid\",\"enable_rerank\":true,\"user_id\":\"alice\",\"top_k\":5}"
+```
+
+### 4. 重新索引
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8000/documents/{document_id}/reindex"
+```
+
+### 5. 查看 retrieval trace
+
+```powershell
+curl.exe "http://127.0.0.1:8000/traces/{trace_id}"
+```
+
+## 检索模式说明
+
+- `vector`：语义检索，适合表达不完全一致的问题
+- `fulltext`：关键词命中，适合短语或明确术语
+- `bm25`：词项相关性排序，适合文档型检索
+- `hybrid`：融合 dense + lexical，默认推荐
+- `rerank`：对候选集二次排序，通常更稳，但会增加延迟
+
+## 评测
+
+### 冒烟验证
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\smoke_test.py
 ```
 
-它会用临时 Qdrant 目录完成一次“解析 -> 切块 -> embedding -> 入库 -> 查询”的端到端验证，不会污染 `.qdrant` 正式数据目录。
-
-## 上传文档
+### API 自动化测试
 
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8000/documents" `
-  -F "file=@samples/demo.md" `
-  -F "source=learning" `
-  -F "tags=rag,embedding"
+.\.venv\Scripts\python.exe -m unittest tests.test_rag_api
 ```
 
-返回示例：
-
-```json
-{
-  "document_id": "生成的 UUID",
-  "filename": "demo.md",
-  "chunk_count": 2
-}
-```
-
-## 搜索片段
+### 离线评测
 
 ```powershell
-curl.exe -X POST "http://127.0.0.1:8000/search" `
-  -H "Content-Type: application/json" `
-  -d "{\"query\":\"为什么 chunk 不能太大？\",\"top_k\":3}"
+.\.venv\Scripts\python.exe scripts\evaluate_rag.py
 ```
 
-返回的 `hits` 里包含：
+评测脚本会比较：
 
-- `score`：向量相似度分数
-- `text`：召回到的原文片段
-- `metadata`：文档来源、页码、标题、标签、chunk 序号等
+- `vector`
+- `bm25`
+- `hybrid`
+- `hybrid + rerank`
 
-## 可配置项
+并输出 `Recall@k`、`MRR@k`、`NDCG@k`、`NoAnswerAcc`、`AnswerWithCitation`。
 
-| 环境变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `QDRANT_PATH` | `.qdrant` | Qdrant 本地数据目录 |
-| `COLLECTION_NAME` | `knowledge_chunks` | collection 名称 |
-| `EMBEDDING_MODEL` | `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` | 默认多语言 embedding 模型 |
-| `EMBEDDING_DIM` | `384` | 当前模型输出向量维度 |
-| `CHUNK_SIZE_TOKENS` | `350` | 每个 chunk 的粗略 token 上限 |
-| `CHUNK_OVERLAP_TOKENS` | `60` | 相邻 chunk 重叠 token 数 |
+## 当前实现说明
 
-这些默认值现在已经写在项目根目录的 `.env` 里。
+- Dense 检索由 Qdrant 承担。
+- `fulltext / bm25 / hybrid / rerank` 在应用层统一编排，便于本地稳定运行与教学分析。
+- 文档元数据、原文件与 retrieval trace 存在 `.rag_data/`。
+- Freshness 当前按“最新 active version 生效”处理。
 
-## 学习路线
+## 下一步建议
 
-建议按这个顺序读代码：
-
-1. `app/parsers.py`：不同格式怎么变成纯文本。
-2. `app/chunking.py`：为什么按段落、标题和代码块切，而不是直接固定字符数。
-3. `app/embeddings.py`：文本如何变成固定长度向量。
-4. `app/vector_store.py`：向量和 metadata 如何写入 Qdrant，查询时如何用 `top_k` 和过滤条件。
-5. `app/main.py`：API 如何把整条链路串起来。
-
-## 下一步练习
-
-- 增加 Hybrid Search：把关键词 BM25 与向量检索结果融合。
-- 增加 Rerank：先召回 `top_k=20`，再用 reranker 选出最相关的 5 条。
-- 增加权限过滤：在 metadata 中加入 `owner` 或 `visibility`。
-- 增加网页前端：做一个上传文档和搜索结果页面。
+- 接入真正的 cross-encoder reranker
+- 引入更系统的评测集与人工标注
+- 增加文档级摘要、标签筛选和批量导入
+- 加入登录鉴权与多租户权限模型
